@@ -1,0 +1,160 @@
+The MCP is an executor, not a terminal emulator and not a collection of specialized tools.
+
+Runtime
+Go.
+stdio MCP.
+/bin/sh / $SHELL.
+No PTY.
+No HTTP.
+HTTP can be added externally by wrapping the stdio MCP.
+Designed to run inside the user's fat toolbox container, where Python, Node, PDF utilities, etc. already exist.
+The MCP itself doesn't need to know about those tools; the LLM can invoke them through shell commands.
+
+
+A command is always started as a job. There is no separate sync/async execution mode
+execute → job
+             ├─ already finished → result
+             └─ running          → job_id
+             
+TOOLS:
+
+# execute
+
+Arguments:
+
+command
+stdin?
+close_stdin?
+nowait?
+capture?
+
+Behavior:
+
+Run $SHELL -c <command>.
+No PTY.
+stdin is ordinary pipe input.
+If stdin is supplied, execute uses the same input operation as input.
+Stdin stays open unless close_stdin=true.
+If nowait=true, 
+	return the job_id immediately once the process has successfully started, 
+	regardless of whether it has already finished.
+else execute effectively does a wait([that_job]).
+A failure to start the process is returned immediately with fail status 	
+	even with nowait=true.
+	
+# wait
+
+Takes an array of job IDs:
+
+wait(job_ids, timeout?)
+
+The important semantics:
+
+Wait for any one of the supplied jobs to change from running to a terminal state.
+Return as soon as that happens.
+Or return when the timeout expires.
+It does not blindly sleep until the timeout.
+Timeout is measured in seconds.
+If several jobs finish before the wake-up is processed, their terminal results can be returned together.
+The capture policy stored with each job determines what output is returned when that job completes.
+
+This is what makes:
+
+execute A → job A
+execute B → job B
+execute C → job C
+wait [A,B,C]
+
+# status
+
+status(job_id)
+
+Returns the state only.
+
+It's useful when the LLM specifically wants to know the state without waiting or retrieving output.
+
+Normal flow doesn't require it.
+
+# output
+
+output(job_id, stdout?, stderr?)
+
+This is not part of the normal completion flow.
+
+It's for the special case:
+
+job is still running (or funished but its output needs deep investigation)
+        ↓
+LLM wants intermediate output
+        ↓
+output(job_id, ...)
+
+stdout/stderr can be:
+nil, 'none', 'all'
+{tail: N}
+{from: P}
+{from: P, length: N}
+
+output(job_id) effectively equals to status(job_id)
+
+# input
+
+input(job_id, data, close?)
+
+Feeds the process's stdin.
+
+close=true means:
+
+write data → close stdin → EOF
+
+The actual stdin-writing implementation is shared with execute; execute should conceptually just invoke the same input operation rather than duplicate it.
+
+No readline/curses/PTY interaction is intended.
+
+# Capture policy
+
+The important design is that the LLM tells execute in advance what output it wants depending on the eventual result:
+
+on_success → capture_spec for a successfull command
+on_error   → capture_spec for a failed command
+
+Capture_spec can specify:
+
+none (no spec at all)
+'stdout' = {stdout: 'all'} -> capture full stdout (up to configured limit)
+'stderr' = {stderr: 'all'} -> capture full stderr (up to configured limit)
+'all' = { stdout: 'all', stderr: 'all'} -> capture stdout + stderr
+{ stdout/stderr: {tail: N} } -> tail N lines of stdout/stderr
+or any allowed { stdout: ???, stderr: ??? } combinations
+
+So, for example, the normal useful default can be:
+
+on_success → stdout
+on_error   → stderr
+
+The policy travels with the job.
+
+Therefore wait() doesn't have to ask the LLM:
+
+"The command succeeded. What output do you want?"
+
+The LLM already specified that when it issued execute.
+
+Capture_spec used in execute tool and in output tool.
+
+internally, use output call in wait (which is alredy used in execute)
+
+Output size
+
+Only one configurable resource limit:
+
+maximum captured output size
+
+The executor keeps bounded output buffers. 
+
+# Configuration
+
+Only two environment-level knobs:
+
+default timeout
+maximum output/file size

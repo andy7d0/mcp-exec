@@ -1,0 +1,35 @@
+# --- Build artifacts ------------------------------------------------------
+# Binary produced by `go build -o mcp-exec .` (anchored to repo root so a
+# directory named mcp-exec elsewhere would not be ignored).
+/mcp-exec
+*.exe
+*.test
+*.out
+coverage.*
+
+# --- Python / pytest -------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# hypothesis plugin's example database (created even without property tests)
+.hypothesis/
+.coverage
+htmlcov/
+
+# --- Local environment & secrets -------------------------------------------
+.env
+*.local
+
+# --- Editors & OS noise ------------------------------------------------------
+.idea/
+.vscode/
+.opencode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Logs ---------------------------------------------------------------------
+*.log
+
