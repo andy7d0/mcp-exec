@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+
+FROM golang:1.24-trixie AS build
+WORKDIR /src
+
+COPY go.mod main.go ./
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /mcp-executor .
+
+# Replace this with your actual toolbox image.
+FROM debian:trixie
+#your-toolbox-image
+
+ENV DEBIAN_FRONTEND=noninteractiv
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+	tini curl ca-certificates git gnupg \
+	python python3-pip python3-venv \
+	pandoc wkhtmltopdf poppler-utils \
+	texlive-latex-base texlive-fonts-recommended \
+	texlive-xetex texlive-lang-cyrillic texlive-latex-recommended \
+	pdftotext \
+	build-essential \
+	podman \
+	ytt ripgrep \
+	&& apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://nodesource.com | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://nodesource.com nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install -y nodejs --no-install-recommends \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    
+RUN npm config set allow-scripts=puppeteer --location=user \
+	&& npm install -g @mermaid-js/mermaid-cli
+
+COPY --from=build /mcp-executor /usr/local/bin/mcp-executor
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/mcp-executor"]
