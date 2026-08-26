@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "mcp-exec": {
+      "type": "local",
+      "command": [
+  "bash",
+  "-c",
+  "echo PWD=$PWD >&2; exec \"$PWD/mcpexec.sh\""
+],
+    //[ "bash", "-c", "exec \"$PWD/mcpexec.sh\"" ],
+      "cwd": "."
+    }
+  }
+}
