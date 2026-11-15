@@ -27,7 +27,6 @@ RUN apt-get update \
 	ripgrep \
 	openssh-client \
 	php \
-	git \
 	&& apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ADD https://github.com/carvel-dev/ytt/releases/download/v0.55.1/ytt-linux-amd64 /usr/local/bin/
