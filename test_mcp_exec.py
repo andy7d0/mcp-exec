@@ -194,6 +194,19 @@ def image():
     )
     if p.returncode != 0:
         pytest.fail(f"podman build failed:\n{p.stdout}\n{p.stderr}")
+    # A tag can be re-pointed at a different image (e.g. the big container or
+    # an older build), and then every test would silently run against the
+    # wrong binary. Fail loudly here instead of letting the suite lie.
+    v = subprocess.run(
+        [PODMAN, "run", "--rm", IMAGE, "--version"],
+        capture_output=True, text=True, timeout=120,
+    )
+    got = v.stdout.strip()
+    if v.returncode != 0 or not got.startswith("mcp-exec "):
+        pytest.fail(
+            f"{IMAGE} does not look like a current build "
+            f"(rc={v.returncode}, stdout={got!r}, stderr={v.stderr.strip()!r}); "
+            f"try `podman rmi {IMAGE}` and re-run")
     return IMAGE
 
 

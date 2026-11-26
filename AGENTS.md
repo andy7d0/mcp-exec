@@ -30,6 +30,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | podman run -i --rm mcp-exec:2.
 
 - Do **not** use pytest-xdist (`-n`): the suite uses session-scoped server containers with shared job registries.
 - `podman rmi mcp-exec-test` forces a rebuild after Go changes (the image fixture caches by tag).
+  The `image` fixture now smoke-tests `--version`, so a tag re-pointed at the big container or an
+  old build fails the session instead of silently testing the wrong binary.
 
 ## Invariants — do not break
 
