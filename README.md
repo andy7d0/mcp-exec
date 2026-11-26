@@ -6,14 +6,14 @@ tools: it runs `$SHELL -c <command>` with ordinary pipes (no PTY), tracks every
 invocation as a *job*, and gives the agent a small, complete control plane over those
 jobs — start, wait, poll, read output, write stdin, signal, list.
 
-It also has a **restricted mode**: set `MCP_EXEC_SCRIPT_FOLDER` to an absolute directory
-and `execute` will only run executable files from that directory, passed literally to the
+It also has a **restricted mode**: start it with `--restricted <absolute-directory>` and
+`execute` will only run executable files from that directory, passed literally to the
 shell — with no `env` or `cwd` overrides.
 
 - **Transport:** JSON-RPC 2.0 over stdio, newline-delimited (one JSON value per line), per the MCP stdio convention.
 - **Protocol version:** `2024-11-05`.
 - **Platforms:** Unix (Linux/macOS). No Windows.
-- **Version:** 1.0.0
+- **Version:** 2.0
 
 ---
 
@@ -87,7 +87,7 @@ Any MCP client that launches a stdio subprocess works the same way.
 
 | Arg | Type | Meaning |
 |---|---|---|
-| `command` | string, required | Shell command line (`$SHELL -c <command>`). In restricted mode: an executable file inside `MCP_EXEC_SCRIPT_FOLDER` (see [Restricted mode](#restricted-mode)) |
+| `command` | string, required | Shell command line (`$SHELL -c <command>`). In restricted mode: an executable file inside the `--restricted` folder (see [Restricted mode](#restricted-mode)) |
 | `args` | string[] | Restricted mode only: arguments passed literally to the script as `$1`, `$2`, …; rejected in plain mode |
 | `cwd` | string | Working directory (default: server's cwd). **Rejected in restricted mode** |
 | `env` | object | Vars layered **on top of** the server environment (merged, not replaced). **Rejected in restricted mode** |
@@ -148,8 +148,8 @@ No args. `{"jobs": [{"job_id", "state"}, …]}`, oldest first. Includes running 
 
 ## Restricted mode
 
-Set `MCP_EXEC_SCRIPT_FOLDER` to an **absolute** directory to enable restricted mode. The
-server refuses to start if the value is relative.
+Start the server with `--restricted <absolute-directory>` to enable restricted mode. The
+server refuses to start (exit code 2) if the path is relative.
 
 In this mode `execute` no longer runs a shell command line:
 
@@ -212,12 +212,20 @@ execute ──▶ running ──▶ success | error ──▶ result delivered o
 
 ## Configuration
 
+| Flag | Meaning |
+|---|---|
+| `--restricted <dir>` | Enable [restricted mode](#restricted-mode); `<dir>` must be absolute |
+| `--version` | Print `mcp-exec 2.0` and exit |
+| `--help` | Print usage and exit |
+
 | Env var | Default | Meaning |
 |---|---|---|
 | `MCP_EXEC_DEFAULT_TIMEOUT` | `60` | Default `wait` timeout, seconds (float) |
 | `MCP_EXEC_MAX_OUTPUT_BYTES` | `1048576` | Retained window per stream per job |
 | `MCP_EXEC_PROGRESS_INTERVAL` | `10` | Seconds between progress notifications |
-| `MCP_EXEC_SCRIPT_FOLDER` | unset | Absolute directory enabling [restricted mode](#restricted-mode); only executable files inside it may be run, and `env` and `cwd` are rejected |
+
+Invalid command lines (unknown flag, relative `--restricted` path, stray positional
+argument) print usage to stderr and exit with code `2`.
 
 ---
 
@@ -235,7 +243,7 @@ The Containerfile is a multi-stage build: `golang:*-alpine` → static binary �
 
 ## Tests
 
-`test_mcp_exec.py` is a self-contained pytest suite (≈127 tests) that builds the image and drives real containers over `podman run -i` via newline-delimited JSON-RPC.
+`test_mcp_exec.py` is a self-contained pytest suite (≈136 tests) that builds the image and drives real containers over `podman run -i` via newline-delimited JSON-RPC.
 
 ```bash
 pytest -v test_mcp_exec.py        # ~3 min including the image build; needs podman
@@ -259,5 +267,5 @@ Note: run without `pytest-xdist` — the suite uses session-scoped servers with 
 ## Security
 
 - The server executes arbitrary commands with the caller's privileges — that is the product. There is no sandboxing, and `env` overrides can set anything the shell honors.
-- **Restricted mode** (`MCP_EXEC_SCRIPT_FOLDER`) narrows the surface to executable files inside one absolute directory and rejects `env`/`cwd`, but those scripts still run with the server user's full privileges. It is an allow-list, not a sandbox.
+- **Restricted mode** (`--restricted`) narrows the surface to executable files inside one absolute directory and rejects `env`/`cwd`, but those scripts still run with the server user's full privileges. It is an allow-list, not a sandbox.
 - The stdio transport has no authentication; the security boundary is whatever launches the process. Run it rootless (`podman`), don't mount sensitive volumes into the container, and never expose it over HTTP without an authenticating proxy in front.

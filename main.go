@@ -7,16 +7,17 @@
 //
 // Tools: execute, wait, status, output, input, kill, list_jobs.
 //
-// Restricted mode: when MCP_EXEC_SCRIPT_FOLDER is set to an absolute
-// directory, `command` is no longer a shell command line. It must name an
+// Restricted mode: when the --restricted <absolute directory> flag is
+// given, `command` is no longer a shell command line. It must name an
 // executable regular file inside that directory (absolute paths, ".."
 // escapes and symlinks resolving outside the directory are rejected), and
 // it is passed literally as the shell's first argument: $SHELL <script>.
 // The optional args array is passed as the script's subsequent argv
-// ($1, $2, ...), also without shell interpretation. Custom env overrides
-// are rejected in this mode; the child inherits the server's environment.
-// The tools/list description advertises the folder and the changed command
-// semantics, and omits env from the schema.
+// ($1, $2, ...), also without shell interpretation. Custom env and cwd
+// overrides are rejected in this mode; the child inherits the server's
+// environment and working directory. The tools/list description advertises
+// the folder and the changed command semantics, and omits env and cwd from
+// the schema.
 //
 // Job lifecycle: a job is deleted from the registry (and becomes
 // inaccessible by any means) as soon as its terminal result has been
@@ -74,12 +75,18 @@
 // implemented here; if HTTP is needed it should be added by wrapping this
 // stdio process externally (e.g. an mcp-proxy in front of it).
 //
+// Command line:
+//
+//	mcp-exec [--restricted <absolute-directory>] [--version]
+//
+//	--restricted <dir>  enable restricted mode (see above); the path must be absolute
+//	--version           print the version and exit
+//
 // Environment-level knobs:
 //
 //	MCP_EXEC_DEFAULT_TIMEOUT    default wait() timeout in seconds (float, default 60)
 //	MCP_EXEC_MAX_OUTPUT_BYTES   max bytes retained per stream per job (default 1<<20)
 //	MCP_EXEC_PROGRESS_INTERVAL  seconds between progress notifications (float, default 10)
-//	MCP_EXEC_SCRIPT_FOLDER      absolute folder enabling restricted mode (default: unset)
 package main
 
 import (
@@ -87,6 +94,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -107,6 +115,10 @@ import (
 // Configuration
 // ---------------------------------------------------------------------
 
+// version is the server version, printed by --version and reported in
+// serverInfo during initialize.
+const version = "2.0"
+
 type config struct {
 	defaultTimeout   time.Duration
 	maxOutputBytes   int
@@ -115,6 +127,67 @@ type config struct {
 	scriptFolder     string // non-empty => restricted mode
 }
 
+// usageError marks a bad command line (wrong flag, relative restricted
+// path, stray positional args) so main can exit with the conventional
+// code 2 rather than looking like a runtime failure.
+type usageError struct{ msg string }
+
+func (e usageError) Error() string { return e.msg }
+
+const usageText = `Usage: mcp-exec [--restricted <absolute-directory>] [--version]
+
+  --restricted <dir>  enable restricted mode: "command" must name an
+                      executable file inside this absolute directory
+  --version           print the version and exit
+`
+
+// parseArgs parses the command line. showVersion requests --version, in
+// which case no configuration is needed and nothing else is validated.
+func parseArgs(args []string) (cfg config, showVersion bool, err error) {
+	fs := flag.NewFlagSet("mcp-exec", flag.ContinueOnError)
+	// Swallow flag's own output: errors are reported once by main, and
+	// --help is answered with our usage text.
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() { fmt.Fprint(os.Stderr, usageText) }
+	restricted := fs.String("restricted", "",
+		"absolute directory enabling restricted mode: command must name an executable file inside it")
+	printVersion := fs.Bool("version", false, "print the version and exit")
+	if perr := fs.Parse(args); perr != nil {
+		if errors.Is(perr, flag.ErrHelp) {
+			return config{}, false, perr
+		}
+		return config{}, false, usageError{perr.Error()}
+	}
+	if *printVersion {
+		return config{}, true, nil
+	}
+	if fs.NArg() > 0 {
+		return config{}, false, usageError{fmt.Sprintf("unexpected argument %q", fs.Arg(0))}
+	}
+	cfg = loadConfig()
+	restrictedSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "restricted" {
+			restrictedSet = true
+		}
+	})
+	if restrictedSet {
+		// Restricted mode trusts this path as the sole source of runnable
+		// commands, so a relative value would silently depend on the
+		// server's cwd and is refused outright.
+		if *restricted == "" {
+			return config{}, false, usageError{"--restricted requires a directory"}
+		}
+		if !filepath.IsAbs(*restricted) {
+			return config{}, false, usageError{fmt.Sprintf("--restricted must be an absolute path, got %q", *restricted)}
+		}
+		cfg.scriptFolder = filepath.Clean(*restricted)
+	}
+	return cfg, false, nil
+}
+
+// loadConfig builds the configuration from the environment; the command
+// line was already parsed by parseArgs.
 func loadConfig() config {
 	cfg := config{
 		defaultTimeout:   60 * time.Second,
@@ -135,16 +208,6 @@ func loadConfig() config {
 		if secs, err := strconv.ParseFloat(v, 64); err == nil && secs > 0 {
 			cfg.progressInterval = time.Duration(secs * float64(time.Second))
 		}
-	}
-	if v := os.Getenv("MCP_EXEC_SCRIPT_FOLDER"); v != "" {
-		// Restricted mode trusts this path as the sole source of runnable
-		// commands, so a relative value would silently depend on the
-		// server's cwd and is refused outright.
-		if !filepath.IsAbs(v) {
-			fmt.Fprintf(os.Stderr, "mcp-exec: MCP_EXEC_SCRIPT_FOLDER must be an absolute path, got %q\n", v)
-			os.Exit(1)
-		}
-		cfg.scriptFolder = filepath.Clean(v)
 	}
 	cfg.shell = os.Getenv("SHELL")
 	if cfg.shell == "" {
@@ -175,26 +238,26 @@ func resolveRestrictedScript(folder, command string) (string, error) {
 		return "", errors.New("\"command\" is required")
 	}
 	if filepath.IsAbs(command) {
-		return "", fmt.Errorf("command %q must be a path relative to MCP_EXEC_SCRIPT_FOLDER (%s)", command, folder)
+		return "", fmt.Errorf("command %q must be a path relative to the --restricted folder (%s)", command, folder)
 	}
 	// Resolve the folder once so containment is checked against the real
 	// directory, not a symlink that might point elsewhere.
 	realFolder, err := filepath.EvalSymlinks(folder)
 	if err != nil {
-		return "", fmt.Errorf("MCP_EXEC_SCRIPT_FOLDER %q: %w", folder, err)
+		return "", fmt.Errorf("--restricted folder %q: %w", folder, err)
 	}
 	candidate := filepath.Join(realFolder, command)
 	if !pathWithin(realFolder, candidate) {
-		return "", fmt.Errorf("command %q escapes MCP_EXEC_SCRIPT_FOLDER (%s)", command, folder)
+		return "", fmt.Errorf("command %q escapes the --restricted folder (%s)", command, folder)
 	}
 	// Resolve the candidate's symlinks too, then re-check containment: a
 	// link inside the folder must not smuggle in an outside executable.
 	realPath, err := filepath.EvalSymlinks(candidate)
 	if err != nil {
-		return "", fmt.Errorf("command %q is not a file in MCP_EXEC_SCRIPT_FOLDER (%s): %w", command, folder, err)
+		return "", fmt.Errorf("command %q is not a file in the --restricted folder (%s): %w", command, folder, err)
 	}
 	if !pathWithin(realFolder, realPath) {
-		return "", fmt.Errorf("command %q resolves outside MCP_EXEC_SCRIPT_FOLDER (%s)", command, folder)
+		return "", fmt.Errorf("command %q resolves outside the --restricted folder (%s)", command, folder)
 	}
 	info, err := os.Stat(realPath)
 	if err != nil {
@@ -903,14 +966,14 @@ func (m *manager) startJob(command string, args []string, cwd string, env map[st
 	var cmd *exec.Cmd
 	if m.cfg.scriptFolder != "" {
 		if len(env) > 0 {
-			return nil, errors.New("custom env is not allowed in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
+			return nil, errors.New("custom env is not allowed in restricted mode (--restricted is set)")
 		}
 		// cwd is rejected rather than honoured: the allow-list is meant to
 		// fix what a script can run, and a caller-chosen directory would
-		// let relative paths inside the script resolve outside
-		// MCP_EXEC_SCRIPT_FOLDER (the scripts themselves may be untrusted).
+		// let relative paths inside the script resolve outside the
+		// --restricted folder (the scripts themselves may be untrusted).
 		if cwd != "" {
-			return nil, errors.New("custom cwd is not allowed in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
+			return nil, errors.New("custom cwd is not allowed in restricted mode (--restricted is set)")
 		}
 		script, err := resolveRestrictedScript(m.cfg.scriptFolder, command)
 		if err != nil {
@@ -921,7 +984,7 @@ func (m *manager) startJob(command string, args []string, cwd string, env map[st
 		cmd = exec.Command(m.cfg.shell, append([]string{script}, args...)...)
 	} else {
 		if len(args) > 0 {
-			return nil, errors.New("\"args\" is only supported in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
+			return nil, errors.New("\"args\" is only supported in restricted mode (--restricted is set)")
 		}
 		cmd = exec.Command(m.cfg.shell, "-c", command)
 	}
@@ -1806,15 +1869,15 @@ func toolDefs(cfg config) []toolDef {
 		"capture":     capturePolicySchema,
 	}
 	if cfg.scriptFolder != "" {
-		executeDescription = fmt.Sprintf("Restricted mode (MCP_EXEC_SCRIPT_FOLDER=%q): run an executable file "+
+		executeDescription = fmt.Sprintf("Restricted mode (--restricted %q): run an executable file "+
 			"from that folder. The command argument must name an executable regular file inside "+
-			"MCP_EXEC_SCRIPT_FOLDER; it is passed literally as the first argument to $SHELL (there is no -c "+
+			"that folder; it is passed literally as the first argument to $SHELL (there is no -c "+
 			"shell command line). The optional args array is passed as the script's subsequent argv "+
 			"($1, $2, ...), again without shell interpretation. Custom env overrides and cwd are "+
 			"not allowed in this mode. ", cfg.scriptFolder) + executeBehavior
 		executeProperties["command"] = map[string]interface{}{
 			"type": "string",
-			"description": fmt.Sprintf("Name of an executable file inside MCP_EXEC_SCRIPT_FOLDER (%s), "+
+			"description": fmt.Sprintf("Name of an executable file inside the --restricted folder (%s), "+
 				"or a path relative to it. It is passed literally as the first argument to $SHELL.", cfg.scriptFolder),
 		}
 		executeProperties["args"] = map[string]interface{}{
@@ -2039,7 +2102,7 @@ func (s *server) handle(ctx context.Context, req rpcRequest) {
 		s.sendResult(req.ID, map[string]interface{}{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo":      map[string]interface{}{"name": "mcp-exec", "version": "1.0.0"},
+			"serverInfo":      map[string]interface{}{"name": "mcp-exec", "version": version},
 		})
 	case "notifications/initialized", "initialized":
 		// No response expected for notifications.
@@ -2126,7 +2189,19 @@ func (s *server) handleToolsCall(ctx context.Context, req rpcRequest) {
 // ---------------------------------------------------------------------
 
 func main() {
-	cfg := loadConfig()
+	cfg, showVersion, err := parseArgs(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(os.Stderr, usageText)
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "mcp-exec: %v\n\n%s", err, usageText)
+		os.Exit(2)
+	}
+	if showVersion {
+		fmt.Println("mcp-exec " + version)
+		return
+	}
 	mgr := newManager(cfg)
 	mgr.installOrphanReaper()
 	srv := newServer(mgr, os.Stdout)

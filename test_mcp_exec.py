@@ -254,9 +254,9 @@ def restricted(image, restricted_scripts):
     c = MCPClient(
         image,
         env={
-            "MCP_EXEC_SCRIPT_FOLDER": "/scripts",
             "MCP_EXEC_DEFAULT_TIMEOUT": "3",
         },
+        command=["--restricted", "/scripts"],
         podman_args=["-v", f"{restricted_scripts}:/scripts:ro"],
     )
     c.handshake()
@@ -337,6 +337,7 @@ class TestProtocol:
     def test_initialize(self, server):
         res = server.initialize_response["result"]
         assert res["serverInfo"]["name"] == "mcp-exec"
+        assert res["serverInfo"]["version"] == "2.0"
         assert "tools" in res["capabilities"]
         assert res["protocolVersion"]
 
@@ -480,7 +481,7 @@ class TestExecute:
 
 
 # ---------------------------------------------------------------------
-# restricted mode (MCP_EXEC_SCRIPT_FOLDER)
+# restricted mode (--restricted)
 # ---------------------------------------------------------------------
 
 class TestRestrictedMode:
@@ -556,11 +557,11 @@ class TestRestrictedMode:
 
     def test_absolute_path_rejected(self, restricted):
         err = restricted.tool_error("execute", {"command": "/bin/echo"})
-        assert "relative to MCP_EXEC_SCRIPT_FOLDER" in err
+        assert "relative to the --restricted folder" in err
 
     def test_path_traversal_rejected(self, restricted):
         err = restricted.tool_error("execute", {"command": "../etc/passwd"})
-        assert "escapes MCP_EXEC_SCRIPT_FOLDER" in err
+        assert "escapes the --restricted folder" in err
 
     def test_non_executable_rejected(self, restricted):
         err = restricted.tool_error("execute", {"command": "noexec.sh"})
@@ -572,7 +573,7 @@ class TestRestrictedMode:
 
     def test_symlink_escape_rejected(self, restricted):
         err = restricted.tool_error("execute", {"command": "escape.sh"})
-        assert "outside MCP_EXEC_SCRIPT_FOLDER" in err
+        assert "outside the --restricted folder" in err
 
     def test_custom_env_rejected(self, restricted):
         err = restricted.tool_error(
@@ -1386,6 +1387,66 @@ class TestProgress:
             assert len(notes) >= 1
         finally:
             cleanup_job(server, job_id)
+
+
+# ---------------------------------------------------------------------
+# Command line: --version, --restricted validation
+# ---------------------------------------------------------------------
+
+def run_image(image, *args, stdin=b""):
+    """Run the server binary in the image with argv `args`, returning the
+    completed process. Used for CLI paths that never speak JSON-RPC."""
+    return subprocess.run(
+        [PODMAN, "run", "-i", "--rm", image, *args],
+        input=stdin, capture_output=True, timeout=120,
+    )
+
+
+class TestCommandLine:
+    def test_version_prints_and_exits(self, image):
+        p = run_image(image, "--version")
+        assert p.returncode == 0
+        assert p.stdout.decode().strip() == "mcp-exec 2.0"
+        assert p.stderr == b""
+
+    def test_help_exits_zero(self, image):
+        p = run_image(image, "--help")
+        assert p.returncode == 0
+        out = p.stderr.decode()
+        assert "--restricted" in out
+        assert "--version" in out
+
+    def test_unknown_flag_exits_two(self, image):
+        p = run_image(image, "--nope")
+        assert p.returncode == 2
+        assert "--restricted" in p.stderr.decode()
+
+    def test_restricted_requires_absolute_path(self, image):
+        p = run_image(image, "--restricted", "scripts")
+        assert p.returncode == 2
+        assert "absolute" in p.stderr.decode()
+
+    def test_restricted_without_value_exits_two(self, image):
+        p = run_image(image, "--restricted")
+        assert p.returncode == 2
+
+    def test_unexpected_positional_exits_two(self, image):
+        p = run_image(image, "stray")
+        assert p.returncode == 2
+        assert "unexpected argument" in p.stderr.decode()
+
+    def test_old_env_var_no_longer_enables_restricted_mode(self, image):
+        # MCP_EXEC_SCRIPT_FOLDER was replaced by --restricted; a leftover env
+        # var must not silently restrict the server.
+        c = MCPClient(image, env={"MCP_EXEC_SCRIPT_FOLDER": "/scripts"})
+        c.handshake()
+        try:
+            tools = {t["name"]: t for t in c.request("tools/list")["result"]["tools"]}
+            props = tools["execute"]["inputSchema"]["properties"]
+            assert "env" in props          # plain mode schema
+            assert "cwd" in props
+        finally:
+            c.close()
 
 
 # ---------------------------------------------------------------------

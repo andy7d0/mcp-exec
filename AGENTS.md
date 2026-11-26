@@ -13,7 +13,7 @@ JSON-RPC 2.0 over stdio, newline-delimited. Unix-only (Linux/macOS) by design.
 
 - `main.go` — the entire server. `go.mod` (module `mcp-executor`, Go 1.24, stdlib only); builds with `go build .`.
 - `Containerfile` — multi-stage build: `golang:*-alpine` → `alpine` + `tini` + bash/procps/coreutils.
-- `test_mcp_exec.py` — self-contained pytest e2e suite (~127 tests) driving real containers via `podman run -i`.
+- `test_mcp_exec.py` — self-contained pytest e2e suite (~136 tests) driving real containers via `podman run -i`.
 - `README.md` — usage, tool reference, semantics, deployment.
 
 ## Commands
@@ -102,9 +102,11 @@ echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | podman run -i --rm mcp-exec:1.
 ## Env knobs
 
 `MCP_EXEC_DEFAULT_TIMEOUT` (60 s), `MCP_EXEC_MAX_OUTPUT_BYTES` (1 MiB),
-`MCP_EXEC_PROGRESS_INTERVAL` (10 s), `MCP_EXEC_SCRIPT_FOLDER` (unset; non-empty absolute
-path enables restricted mode: `command` must be an executable file inside it, invoked as
-`$SHELL <script>`, `args` become the script's argv, and `env`/`cwd` overrides are rejected).
+`MCP_EXEC_PROGRESS_INTERVAL` (10 s). Restricted mode is off by default and enabled by the
+`--restricted <absolute-directory>` flag (not an env var): `command` must be an executable
+file inside that directory, invoked as `$SHELL <script>`, `args` become the script's argv,
+and `env`/`cwd` overrides are rejected. `--version` prints `mcp-exec 2.0` and exits; bad
+command lines exit with code 2.
 
 ## Known limitations — accepted; discuss before "fixing"
 
