@@ -87,6 +87,7 @@
 //	MCP_EXEC_DEFAULT_TIMEOUT    default wait() timeout in seconds (float, default 60)
 //	MCP_EXEC_MAX_OUTPUT_BYTES   max bytes retained per stream per job (default 1<<20)
 //	MCP_EXEC_PROGRESS_INTERVAL  seconds between progress notifications (float, default 10)
+//
 package main
 
 import (
