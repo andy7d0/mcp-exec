@@ -43,10 +43,10 @@ Files: `main.go` (the server), `Containerfile`, `test_mcp_exec.py` (the e2e suit
 
 ```bash
 # build the image (Go multi-stage build; runtime = alpine + tini)
-podman build -t mcp-exec:1.0.0 .
+podman build -t mcp-exec:2.0 .
 
 # sanity check: talk to it by hand
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | podman run -i --rm mcp-exec:1.0.0
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | podman run -i --rm mcp-exec:2.0
 ```
 
 ### Client configuration
@@ -58,7 +58,7 @@ Claude Desktop (`claude_desktop_config.json`):
   "mcpServers": {
     "exec": {
       "command": "podman",
-      "args": ["run", "-i", "--rm", "mcp-exec:1.0.0"]
+      "args": ["run", "-i", "--rm", "mcp-exec:2.0"]
     }
   }
 }
@@ -71,7 +71,7 @@ OpenCode (`opencode.json`):
   "mcp": {
     "exec": {
       "type": "local",
-      "command": ["podman", "run", "-i", "--rm", "mcp-exec:1.0.0"]
+      "command": ["podman", "run", "-i", "--rm", "mcp-exec:2.0"]
     }
   }
 }
@@ -150,6 +150,11 @@ No args. `{"jobs": [{"job_id", "state"}, …]}`, oldest first. Includes running 
 
 Start the server with `--restricted <absolute-directory>` to enable restricted mode. The
 server refuses to start (exit code 2) if the path is relative.
+
+```bash
+# inside the image, mount the allow-listed scripts read-only and pass the flag
+podman run -i --rm -v "$PWD/scripts:/scripts:ro" mcp-exec:2.0 --restricted /scripts
+```
 
 In this mode `execute` no longer runs a shell command line:
 
@@ -236,7 +241,7 @@ argument) print usage to stderr and exit with code `2`.
 CGO_ENABLED=0 go build -o mcp-exec .
 
 # container image (recommended)
-podman build -t mcp-exec:1.0.0 .
+podman build -t mcp-exec:2.0 .
 ```
 
 The Containerfile is a multi-stage build: `golang:*-alpine` → static binary → `alpine` runtime with `tini` (optional belt-and-suspenders PID 1) and `bash`/`procps`/`coreutils` for predictable command behavior.

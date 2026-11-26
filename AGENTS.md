@@ -19,13 +19,13 @@ JSON-RPC 2.0 over stdio, newline-delimited. Unix-only (Linux/macOS) by design.
 ## Commands
 
 ```bash
-podman build -t mcp-exec:1.0.0 .          # build the image
+podman build -t mcp-exec:2.0 .            # build the image
 pytest -v test_mcp_exec.py                # full suite (~3 min incl. build; needs podman + pytest)
 pytest -v test_mcp_exec.py::TestKill      # one class
 pytest -v test_mcp_exec.py::TestKill::test_kill_term   # one test
 
 # raw stdio smoke test
-echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | podman run -i --rm mcp-exec:1.0.0
+echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | podman run -i --rm mcp-exec:2.0
 ```
 
 - Do **not** use pytest-xdist (`-n`): the suite uses session-scoped server containers with shared job registries.
@@ -98,8 +98,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | podman run -i --rm mcp-exec:1.
   deliberately request-outliving (capture readers, `teardownWG`) — and says so in a comment.
 - New env knob → `loadConfig` + header comment + README table; check test fixtures, which pin
   specific values via container env.
+- New CLI flag → `parseArgs` + `usageText` + header comment + README flags table. Bad command
+  lines must fail via `usageError` (main exits 2); never `os.Exit` from a parser helper.
 
-## Env knobs
+## Env knobs and flags
 
 `MCP_EXEC_DEFAULT_TIMEOUT` (60 s), `MCP_EXEC_MAX_OUTPUT_BYTES` (1 MiB),
 `MCP_EXEC_PROGRESS_INTERVAL` (10 s). Restricted mode is off by default and enabled by the
