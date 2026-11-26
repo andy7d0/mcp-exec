@@ -894,7 +894,8 @@ func writeStdinCancellable(ctx context.Context, j *job, data string, closeAfter 
 // (cfg.scriptFolder != "") command names an executable file inside that
 // folder and is passed literally to the shell; validation failures are
 // returned as errors before any process is started. Any extra args are
-// handed to the script as argv in restricted mode.
+// handed to the script as argv in restricted mode, and both env and cwd
+// overrides are refused.
 func (m *manager) startJob(command string, args []string, cwd string, env map[string]string, capture *capturePolicy) (*job, error) {
 	if capture == nil {
 		capture = defaultCapturePolicy()
@@ -903,6 +904,13 @@ func (m *manager) startJob(command string, args []string, cwd string, env map[st
 	if m.cfg.scriptFolder != "" {
 		if len(env) > 0 {
 			return nil, errors.New("custom env is not allowed in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
+		}
+		// cwd is rejected rather than honoured: the allow-list is meant to
+		// fix what a script can run, and a caller-chosen directory would
+		// let relative paths inside the script resolve outside
+		// MCP_EXEC_SCRIPT_FOLDER (the scripts themselves may be untrusted).
+		if cwd != "" {
+			return nil, errors.New("custom cwd is not allowed in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
 		}
 		script, err := resolveRestrictedScript(m.cfg.scriptFolder, command)
 		if err != nil {
@@ -1802,8 +1810,8 @@ func toolDefs(cfg config) []toolDef {
 			"from that folder. The command argument must name an executable regular file inside "+
 			"MCP_EXEC_SCRIPT_FOLDER; it is passed literally as the first argument to $SHELL (there is no -c "+
 			"shell command line). The optional args array is passed as the script's subsequent argv "+
-			"($1, $2, ...), again without shell interpretation. Custom env overrides are not allowed in "+
-			"this mode. ", cfg.scriptFolder) + executeBehavior
+			"($1, $2, ...), again without shell interpretation. Custom env overrides and cwd are "+
+			"not allowed in this mode. ", cfg.scriptFolder) + executeBehavior
 		executeProperties["command"] = map[string]interface{}{
 			"type": "string",
 			"description": fmt.Sprintf("Name of an executable file inside MCP_EXEC_SCRIPT_FOLDER (%s), "+
@@ -1814,9 +1822,10 @@ func toolDefs(cfg config) []toolDef {
 			"items":       map[string]interface{}{"type": "string"},
 			"description": "Arguments passed literally to the script as its argv ($1, $2, ...).",
 		}
-		// env is not merely ignored: it is rejected at call time, so it must
-		// not be advertised in the schema either.
+		// env and cwd are not merely ignored: they are rejected at call
+		// time, so they must not be advertised in the schema either.
 		delete(executeProperties, "env")
+		delete(executeProperties, "cwd")
 	}
 	return []toolDef{
 		{

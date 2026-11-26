@@ -242,6 +242,7 @@ def restricted_scripts(tmp_path_factory):
                      "for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done\n")
     write("fail.sh", "#!/bin/sh\necho boom >&2\nexit 7\n")
     write("cat.sh", "#!/bin/sh\ncat\n")
+    write("pwd.sh", "#!/bin/sh\npwd\n")
     write("noexec.sh", "#!/bin/sh\necho should-not-run\n", mode=0o644)
     write("sub/nested.sh", "#!/bin/sh\necho nested-ok\n")
     (d / "escape.sh").symlink_to("/bin/echo")
@@ -489,6 +490,7 @@ class TestRestrictedMode:
         assert "/scripts" in execute["description"]
         assert "/scripts" in execute["inputSchema"]["properties"]["command"]["description"]
         assert "env" not in execute["inputSchema"]["properties"]
+        assert "cwd" not in execute["inputSchema"]["properties"]
         assert "args" in execute["inputSchema"]["properties"]
 
     def test_script_runs_without_dash_c(self, restricted):
@@ -526,10 +528,16 @@ class TestRestrictedMode:
         assert res["exit_code"] == 7
         assert "boom" in res["stderr"]["data"]
 
-    def test_stdin_and_cwd_still_work(self, restricted):
-        res = run(restricted, "cat.sh", stdin="via-stdin\n", close_stdin=True, cwd="/tmp")
+    def test_stdin_still_works(self, restricted):
+        res = run(restricted, "cat.sh", stdin="via-stdin\n", close_stdin=True)
         assert res["state"] == "success"
         assert res["stdout"]["data"] == "via-stdin\n"
+
+    def test_script_runs_in_server_cwd(self, restricted):
+        # cwd cannot be overridden, so pwd must report the server's own cwd.
+        res = run(restricted, "pwd.sh")
+        assert res["state"] == "success"
+        assert res["stdout"]["data"].strip().startswith("/")
 
     def test_nested_relative_path(self, restricted):
         res = run(restricted, "sub/nested.sh")
@@ -570,6 +578,12 @@ class TestRestrictedMode:
         err = restricted.tool_error(
             "execute", {"command": "hello.sh", "env": {"MCP_TEST_VAR": "nope"}})
         assert "env" in err.lower()
+
+    def test_custom_cwd_rejected(self, restricted):
+        err = restricted.tool_error(
+            "execute", {"command": "hello.sh", "cwd": "/tmp"})
+        assert "cwd" in err.lower()
+        assert "restricted mode" in err.lower()
 
 
 # ---------------------------------------------------------------------

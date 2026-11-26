@@ -104,7 +104,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | podman run -i --rm mcp-exec:1.
 `MCP_EXEC_DEFAULT_TIMEOUT` (60 s), `MCP_EXEC_MAX_OUTPUT_BYTES` (1 MiB),
 `MCP_EXEC_PROGRESS_INTERVAL` (10 s), `MCP_EXEC_SCRIPT_FOLDER` (unset; non-empty absolute
 path enables restricted mode: `command` must be an executable file inside it, invoked as
-`$SHELL <script>`, `args` become the script's argv, and `env` overrides are rejected).
+`$SHELL <script>`, `args` become the script's argv, and `env`/`cwd` overrides are rejected).
 
 ## Known limitations — accepted; discuss before "fixing"
 
