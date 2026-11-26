@@ -6,6 +6,10 @@ tools: it runs `$SHELL -c <command>` with ordinary pipes (no PTY), tracks every
 invocation as a *job*, and gives the agent a small, complete control plane over those
 jobs — start, wait, poll, read output, write stdin, signal, list.
 
+It also has a **restricted mode**: set `MCP_EXEC_SCRIPT_FOLDER` to an absolute directory
+and `execute` will only run executable files from that directory, passed literally to the
+shell — with no `env` overrides.
+
 - **Transport:** JSON-RPC 2.0 over stdio, newline-delimited (one JSON value per line), per the MCP stdio convention.
 - **Protocol version:** `2024-11-05`.
 - **Platforms:** Unix (Linux/macOS). No Windows.
@@ -83,9 +87,10 @@ Any MCP client that launches a stdio subprocess works the same way.
 
 | Arg | Type | Meaning |
 |---|---|---|
-| `command` | string, required | Shell command line (`$SHELL -c <command>`) |
+| `command` | string, required | Shell command line (`$SHELL -c <command>`). In restricted mode: an executable file inside `MCP_EXEC_SCRIPT_FOLDER` (see [Restricted mode](#restricted-mode)) |
+| `args` | string[] | Restricted mode only: arguments passed literally to the script as `$1`, `$2`, …; rejected in plain mode |
 | `cwd` | string | Working directory (default: server's cwd) |
-| `env` | object | Vars layered **on top of** the server environment (merged, not replaced) |
+| `env` | object | Vars layered **on top of** the server environment (merged, not replaced). **Rejected in restricted mode** |
 | `stdin` | string | Data written to the process's stdin immediately |
 | `close_stdin` | bool | Close stdin (EOF) after writing. Default `false` (stays open for `input`) |
 | `nowait` | bool | Return `{job_id, state:"running"}` immediately instead of blocking |
@@ -141,6 +146,29 @@ No args. `{"jobs": [{"job_id", "state"}, …]}`, oldest first. Includes running 
 
 ---
 
+## Restricted mode
+
+Set `MCP_EXEC_SCRIPT_FOLDER` to an **absolute** directory to enable restricted mode. The
+server refuses to start if the value is relative.
+
+In this mode `execute` no longer runs a shell command line:
+
+- `command` must name an **executable regular file inside** that directory (a nested
+  relative path is fine). Absolute paths, `..` escapes, and symlinks that resolve outside
+  the directory are rejected with a tool error.
+- The file is passed **literally as the shell's first argument**: `$SHELL <script>`
+  instead of `$SHELL -c <command>`. Nothing supplied by the caller is parsed as shell
+  syntax. The optional `args` array becomes the script's `$1`, `$2`, … — also literal.
+- `env` overrides are rejected; the child inherits the server's environment. `cwd`,
+  `stdin`, `close_stdin`, `nowait`, `capture`, and every job-control tool behave as usual.
+- `tools/list` advertises the configured folder in the `execute` description, explains
+  the changed `command` role, and omits `env` from the input schema.
+
+This is an allow-list for *what can run*, not a sandbox: scripts themselves can still do
+anything the server user can do.
+
+---
+
 ## Stream capture specs
 
 A stream argument accepts:
@@ -188,6 +216,7 @@ execute ──▶ running ──▶ success | error ──▶ result delivered o
 | `MCP_EXEC_DEFAULT_TIMEOUT` | `60` | Default `wait` timeout, seconds (float) |
 | `MCP_EXEC_MAX_OUTPUT_BYTES` | `1048576` | Retained window per stream per job |
 | `MCP_EXEC_PROGRESS_INTERVAL` | `10` | Seconds between progress notifications |
+| `MCP_EXEC_SCRIPT_FOLDER` | unset | Absolute directory enabling [restricted mode](#restricted-mode); only executable files inside it may be run, and `env` is rejected |
 
 ---
 
@@ -205,13 +234,13 @@ The Containerfile is a multi-stage build: `golang:*-alpine` → static binary �
 
 ## Tests
 
-`test_mcp_exec.py` is a self-contained pytest suite (≈109 tests) that builds the image and drives real containers over `podman run -i` via newline-delimited JSON-RPC.
+`test_mcp_exec.py` is a self-contained pytest suite (≈127 tests) that builds the image and drives real containers over `podman run -i` via newline-delimited JSON-RPC.
 
 ```bash
 pytest -v test_mcp_exec.py        # ~3 min including the image build; needs podman
 ```
 
-Coverage: protocol basics; execute/wait/status/output/input semantics; capture policies; the byte-window with exact suffix/truncation math (KB and MB scale); character alignment and byte-offset pagination; binary torture (NULs, invalid UTF-8, base64 fidelity); stdin incl. 200 KB writes and cancellation; kill (TERM/KILL/ASSURED, survivors, orphaned grandchildren, concurrent kill races); list_jobs; cancellation incl. late/double/mismatched cancels; progress notifications; bare-PID-1 reaping; graceful shutdown; concurrent-request behavior.
+Coverage: protocol basics; execute/wait/status/output/input semantics; capture policies; the byte-window with exact suffix/truncation math (KB and MB scale); character alignment and byte-offset pagination; binary torture (NULs, invalid UTF-8, base64 fidelity); stdin incl. 200 KB writes and cancellation; kill (TERM/KILL/ASSURED, survivors, orphaned grandchildren, concurrent kill races); list_jobs; cancellation incl. late/double/mismatched cancels; progress notifications; restricted mode (allow-listed scripts, literal script argv, path escape and non-executable rejection, env rejection, schema/description changes); bare-PID-1 reaping; graceful shutdown; concurrent-request behavior.
 
 Note: run without `pytest-xdist` — the suite uses session-scoped servers with shared job registries.
 
@@ -229,4 +258,5 @@ Note: run without `pytest-xdist` — the suite uses session-scoped servers with 
 ## Security
 
 - The server executes arbitrary commands with the caller's privileges — that is the product. There is no sandboxing, and `env` overrides can set anything the shell honors.
+- **Restricted mode** (`MCP_EXEC_SCRIPT_FOLDER`) narrows the surface to executable files inside one absolute directory and rejects `env`, but those scripts still run with the server user's full privileges. It is an allow-list, not a sandbox.
 - The stdio transport has no authentication; the security boundary is whatever launches the process. Run it rootless (`podman`), don't mount sensitive volumes into the container, and never expose it over HTTP without an authenticating proxy in front.

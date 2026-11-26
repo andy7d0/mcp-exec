@@ -44,8 +44,9 @@ class ToolError(Exception):
 class MCPClient:
     """Speaks newline-delimited JSON-RPC 2.0 with `podman run -i <image>`."""
 
-    def __init__(self, image, env=None, command=None):
+    def __init__(self, image, env=None, command=None, podman_args=None):
         args = [PODMAN, "run", "-i", "--rm"]
+        args += list(podman_args or [])
         for k, v in sorted((env or {}).items()):
             args += ["-e", f"{k}={v}"]
         args.append(image)
@@ -225,6 +226,43 @@ def mbuf(image):
     c.close()
 
 
+@pytest.fixture(scope="session")
+def restricted_scripts(tmp_path_factory):
+    """Host directory bind-mounted at /scripts in the restricted server."""
+    d = tmp_path_factory.mktemp("mcp-exec-scripts")
+
+    def write(name, body, mode=0o755):
+        p = d / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+        p.chmod(mode)
+
+    write("hello.sh", "#!/bin/sh\nprintf 'hello:%s\\n' \"$*\"\n")
+    write("args.sh", "#!/bin/sh\nprintf 'argc=%s\\nzero=%s\\n' \"$#\" \"$0\"\n"
+                     "for a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done\n")
+    write("fail.sh", "#!/bin/sh\necho boom >&2\nexit 7\n")
+    write("cat.sh", "#!/bin/sh\ncat\n")
+    write("noexec.sh", "#!/bin/sh\necho should-not-run\n", mode=0o644)
+    write("sub/nested.sh", "#!/bin/sh\necho nested-ok\n")
+    (d / "escape.sh").symlink_to("/bin/echo")
+    return d
+
+
+@pytest.fixture(scope="session")
+def restricted(image, restricted_scripts):
+    c = MCPClient(
+        image,
+        env={
+            "MCP_EXEC_SCRIPT_FOLDER": "/scripts",
+            "MCP_EXEC_DEFAULT_TIMEOUT": "3",
+        },
+        podman_args=["-v", f"{restricted_scripts}:/scripts:ro"],
+    )
+    c.handshake()
+    yield c
+    c.close()
+
+
 @pytest.fixture()
 def bare_server(image):
     # No tini: the server runs as PID 1 and its orphan reaper must work.
@@ -312,6 +350,12 @@ class TestProtocol:
             assert t["description"]
             assert t["inputSchema"]["type"] == "object"
 
+    def test_execute_schema_plain_mode(self, server):
+        tools = {t["name"]: t for t in server.request("tools/list")["result"]["tools"]}
+        props = tools["execute"]["inputSchema"]["properties"]
+        assert "env" in props
+        assert "args" not in props
+
     def test_unknown_method(self, server):
         assert server.request("bogus/method")["error"]["code"] == -32601
 
@@ -383,6 +427,10 @@ class TestExecute:
         res2 = run(server, 'echo "${PATH:+path-ok}"')
         assert res2["stdout"]["data"].strip() == "path-ok"
 
+    def test_args_rejected_in_plain_mode(self, server):
+        err = server.tool_error("execute", {"command": "echo hi", "args": ["x"]})
+        assert "restricted mode" in err
+
     def test_stdin_data_with_close(self, server):
         res = run(server, "cat", stdin="hello via stdin\n", close_stdin=True)
         assert res["state"] == "success"
@@ -428,6 +476,100 @@ class TestExecute:
         res = run(server, "printf 'aaa\\nbbb'")
         assert res["stdout"]["data"] == "aaa\nbbb"
         assert res["stdout"]["total_bytes"] == 7
+
+
+# ---------------------------------------------------------------------
+# restricted mode (MCP_EXEC_SCRIPT_FOLDER)
+# ---------------------------------------------------------------------
+
+class TestRestrictedMode:
+    def test_tools_list_shows_folder_and_hides_env(self, restricted):
+        tools = {t["name"]: t for t in restricted.request("tools/list")["result"]["tools"]}
+        execute = tools["execute"]
+        assert "/scripts" in execute["description"]
+        assert "/scripts" in execute["inputSchema"]["properties"]["command"]["description"]
+        assert "env" not in execute["inputSchema"]["properties"]
+        assert "args" in execute["inputSchema"]["properties"]
+
+    def test_script_runs_without_dash_c(self, restricted):
+        res = run(restricted, "hello.sh")
+        assert res["state"] == "success"
+        assert res["stdout"]["data"] == "hello:\n"
+
+    def test_script_path_is_first_shell_arg(self, restricted):
+        res = run(restricted, "args.sh")
+        assert res["state"] == "success"
+        assert "argc=0" in res["stdout"]["data"]
+        assert "zero=/scripts/args.sh" in res["stdout"]["data"]
+
+    def test_script_receives_argv(self, restricted):
+        res = run(restricted, "args.sh", args=["one", "two words"])
+        assert res["state"] == "success"
+        data = res["stdout"]["data"]
+        assert "argc=2" in data
+        assert "arg=one\n" in data
+        assert "arg=two words\n" in data
+
+    def test_script_args_are_literal(self, restricted):
+        argv = ["$(id)", "; echo pwned", "*"]
+        res = run(restricted, "args.sh", args=argv)
+        assert res["state"] == "success"
+        data = res["stdout"]["data"]
+        assert "argc=3" in data
+        for a in argv:
+            assert f"arg={a}\n" in data
+        assert "uid=" not in data
+
+    def test_script_exit_status(self, restricted):
+        res = run(restricted, "fail.sh")
+        assert res["state"] == "error"
+        assert res["exit_code"] == 7
+        assert "boom" in res["stderr"]["data"]
+
+    def test_stdin_and_cwd_still_work(self, restricted):
+        res = run(restricted, "cat.sh", stdin="via-stdin\n", close_stdin=True, cwd="/tmp")
+        assert res["state"] == "success"
+        assert res["stdout"]["data"] == "via-stdin\n"
+
+    def test_nested_relative_path(self, restricted):
+        res = run(restricted, "sub/nested.sh")
+        assert res["state"] == "success"
+        assert res["stdout"]["data"] == "nested-ok\n"
+
+    def test_nowait_and_wait(self, restricted):
+        job_id = spawn(restricted, "hello.sh")
+        res = reap(restricted, job_id)
+        assert res["stdout"]["data"] == "hello:\n"
+
+    def test_shell_syntax_is_not_interpreted(self, restricted):
+        err = restricted.tool_error("execute", {"command": "echo hello"})
+        assert "not a file" in err
+        assert "hello\n" not in err
+
+    def test_absolute_path_rejected(self, restricted):
+        err = restricted.tool_error("execute", {"command": "/bin/echo"})
+        assert "relative to MCP_EXEC_SCRIPT_FOLDER" in err
+
+    def test_path_traversal_rejected(self, restricted):
+        err = restricted.tool_error("execute", {"command": "../etc/passwd"})
+        assert "escapes MCP_EXEC_SCRIPT_FOLDER" in err
+
+    def test_non_executable_rejected(self, restricted):
+        err = restricted.tool_error("execute", {"command": "noexec.sh"})
+        assert "not executable" in err
+
+    def test_missing_script_rejected(self, restricted):
+        err = restricted.tool_error("execute", {"command": "missing.sh"})
+        assert "not a file" in err
+
+    def test_symlink_escape_rejected(self, restricted):
+        err = restricted.tool_error("execute", {"command": "escape.sh"})
+        assert "outside MCP_EXEC_SCRIPT_FOLDER" in err
+
+    def test_custom_env_rejected(self, restricted):
+        err = restricted.tool_error(
+            "execute", {"command": "hello.sh", "env": {"MCP_TEST_VAR": "nope"}})
+        assert "env" in err.lower()
 
 
 # ---------------------------------------------------------------------

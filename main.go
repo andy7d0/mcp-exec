@@ -7,6 +7,17 @@
 //
 // Tools: execute, wait, status, output, input, kill, list_jobs.
 //
+// Restricted mode: when MCP_EXEC_SCRIPT_FOLDER is set to an absolute
+// directory, `command` is no longer a shell command line. It must name an
+// executable regular file inside that directory (absolute paths, ".."
+// escapes and symlinks resolving outside the directory are rejected), and
+// it is passed literally as the shell's first argument: $SHELL <script>.
+// The optional args array is passed as the script's subsequent argv
+// ($1, $2, ...), also without shell interpretation. Custom env overrides
+// are rejected in this mode; the child inherits the server's environment.
+// The tools/list description advertises the folder and the changed command
+// semantics, and omits env from the schema.
+//
 // Job lifecycle: a job is deleted from the registry (and becomes
 // inaccessible by any means) as soon as its terminal result has been
 // captured and delivered by execute() or wait(), or by kill() once the
@@ -68,6 +79,7 @@
 //	MCP_EXEC_DEFAULT_TIMEOUT    default wait() timeout in seconds (float, default 60)
 //	MCP_EXEC_MAX_OUTPUT_BYTES   max bytes retained per stream per job (default 1<<20)
 //	MCP_EXEC_PROGRESS_INTERVAL  seconds between progress notifications (float, default 10)
+//	MCP_EXEC_SCRIPT_FOLDER      absolute folder enabling restricted mode (default: unset)
 package main
 
 import (
@@ -80,6 +92,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -99,6 +112,7 @@ type config struct {
 	maxOutputBytes   int
 	progressInterval time.Duration
 	shell            string
+	scriptFolder     string // non-empty => restricted mode
 }
 
 func loadConfig() config {
@@ -122,11 +136,77 @@ func loadConfig() config {
 			cfg.progressInterval = time.Duration(secs * float64(time.Second))
 		}
 	}
+	if v := os.Getenv("MCP_EXEC_SCRIPT_FOLDER"); v != "" {
+		// Restricted mode trusts this path as the sole source of runnable
+		// commands, so a relative value would silently depend on the
+		// server's cwd and is refused outright.
+		if !filepath.IsAbs(v) {
+			fmt.Fprintf(os.Stderr, "mcp-exec: MCP_EXEC_SCRIPT_FOLDER must be an absolute path, got %q\n", v)
+			os.Exit(1)
+		}
+		cfg.scriptFolder = filepath.Clean(v)
+	}
 	cfg.shell = os.Getenv("SHELL")
 	if cfg.shell == "" {
 		cfg.shell = "/bin/sh"
 	}
 	return cfg
+}
+
+// ---------------------------------------------------------------------
+// Restricted mode
+// ---------------------------------------------------------------------
+
+// pathWithin reports whether path is base itself or lies below it.
+func pathWithin(base, path string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveRestrictedScript validates that command names an executable regular
+// file inside folder and returns the path to hand to the shell. Absolute
+// paths, ".." escapes, and symlinks that resolve outside the folder are
+// rejected: the folder is the allow-list, not merely a starting point.
+func resolveRestrictedScript(folder, command string) (string, error) {
+	if strings.TrimSpace(command) == "" {
+		return "", errors.New("\"command\" is required")
+	}
+	if filepath.IsAbs(command) {
+		return "", fmt.Errorf("command %q must be a path relative to MCP_EXEC_SCRIPT_FOLDER (%s)", command, folder)
+	}
+	// Resolve the folder once so containment is checked against the real
+	// directory, not a symlink that might point elsewhere.
+	realFolder, err := filepath.EvalSymlinks(folder)
+	if err != nil {
+		return "", fmt.Errorf("MCP_EXEC_SCRIPT_FOLDER %q: %w", folder, err)
+	}
+	candidate := filepath.Join(realFolder, command)
+	if !pathWithin(realFolder, candidate) {
+		return "", fmt.Errorf("command %q escapes MCP_EXEC_SCRIPT_FOLDER (%s)", command, folder)
+	}
+	// Resolve the candidate's symlinks too, then re-check containment: a
+	// link inside the folder must not smuggle in an outside executable.
+	realPath, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", fmt.Errorf("command %q is not a file in MCP_EXEC_SCRIPT_FOLDER (%s): %w", command, folder, err)
+	}
+	if !pathWithin(realFolder, realPath) {
+		return "", fmt.Errorf("command %q resolves outside MCP_EXEC_SCRIPT_FOLDER (%s)", command, folder)
+	}
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return "", fmt.Errorf("command %q: %w", command, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("command %q is not a regular file", command)
+	}
+	if info.Mode().Perm()&0111 == 0 {
+		return "", fmt.Errorf("command %q is not executable", command)
+	}
+	return realPath, nil
 }
 
 // ---------------------------------------------------------------------
@@ -436,7 +516,7 @@ func renderCapture(buf *capBuffer, spec streamCapture) *captureResult {
 			rel, end = alignToRunes(data, rel, end)
 		}
 		res.Offset = dropped + rel
-		res.Bytes = end - rel          // post-alignment end
+		res.Bytes = end - rel // post-alignment end
 		res.Data = toSafeText(data[rel:end])
 		return res
 	}
@@ -810,12 +890,33 @@ func writeStdinCancellable(ctx context.Context, j *job, data string, closeAfter 
 }
 
 // startJob starts `command` as a new job; see the package doc for the
-// process-group, capture-pipe and PID-1 design notes.
-func (m *manager) startJob(command, cwd string, env map[string]string, capture *capturePolicy) *job {
+// process-group, capture-pipe and PID-1 design notes. In restricted mode
+// (cfg.scriptFolder != "") command names an executable file inside that
+// folder and is passed literally to the shell; validation failures are
+// returned as errors before any process is started. Any extra args are
+// handed to the script as argv in restricted mode.
+func (m *manager) startJob(command string, args []string, cwd string, env map[string]string, capture *capturePolicy) (*job, error) {
 	if capture == nil {
 		capture = defaultCapturePolicy()
 	}
-	cmd := exec.Command(m.cfg.shell, "-c", command)
+	var cmd *exec.Cmd
+	if m.cfg.scriptFolder != "" {
+		if len(env) > 0 {
+			return nil, errors.New("custom env is not allowed in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
+		}
+		script, err := resolveRestrictedScript(m.cfg.scriptFolder, command)
+		if err != nil {
+			return nil, err
+		}
+		// No "-c": the script path and its argv are literal arguments, so
+		// nothing the caller supplied is ever parsed as shell syntax.
+		cmd = exec.Command(m.cfg.shell, append([]string{script}, args...)...)
+	} else {
+		if len(args) > 0 {
+			return nil, errors.New("\"args\" is only supported in restricted mode (MCP_EXEC_SCRIPT_FOLDER is set)")
+		}
+		cmd = exec.Command(m.cfg.shell, "-c", command)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if cwd != "" {
 		cmd.Dir = cwd
@@ -861,7 +962,7 @@ func (m *manager) startJob(command, cwd string, env map[string]string, capture *
 		j.endedAt = time.Now()
 		j.mu.Unlock()
 		close(j.done)
-		return j
+		return j, nil
 	}
 	cmd.Stdout = outW
 	cmd.Stderr = errW
@@ -873,7 +974,7 @@ func (m *manager) startJob(command, cwd string, env map[string]string, capture *
 		j.endedAt = time.Now()
 		j.mu.Unlock()
 		close(j.done)
-		return j
+		return j, nil
 	}
 	m.trackPid(j)
 	// Parent never writes to these ends: close so EOF arrives once the
@@ -917,7 +1018,7 @@ func (m *manager) startJob(command, cwd string, env map[string]string, capture *
 		m.untrackPid(pid)
 		close(j.done)
 	}()
-	return j
+	return j, nil
 }
 
 // teardown makes a best-effort ensured kill of j (SIGTERM to the whole
@@ -1256,6 +1357,7 @@ func chanClosed(ch <-chan struct{}) bool {
 
 type executeArgs struct {
 	Command    string            `json:"command"`
+	Args       []string          `json:"args,omitempty"`
 	Cwd        string            `json:"cwd,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
 	Stdin      *string           `json:"stdin,omitempty"`
@@ -1303,7 +1405,10 @@ func (m *manager) toolExecute(ctx context.Context, raw json.RawMessage, rep *pro
 	if strings.TrimSpace(args.Command) == "" {
 		return nil, errors.New("\"command\" is required")
 	}
-	j := m.startJob(args.Command, args.Cwd, args.Env, args.Capture)
+	j, err := m.startJob(args.Command, args.Args, args.Cwd, args.Env, args.Capture)
+	if err != nil {
+		return nil, err
+	}
 	// A failure to start is returned immediately with fail status,
 	// regardless of nowait. The terminal result is captured right here,
 	// so the job is reaped before returning and is no longer accessible.
@@ -1612,7 +1717,7 @@ type toolDef struct {
 	InputSchema map[string]interface{} `json:"inputSchema"`
 }
 
-func toolDefs() []toolDef {
+func toolDefs(cfg config) []toolDef {
 	streamCaptureSchema := map[string]interface{}{
 		"description": `"none" (omit), "all" (the whole retained window), {"tail": N} (last N lines), ` +
 			`{"from": P} (from absolute byte offset P, measured from the very start of the stream), ` +
@@ -1668,35 +1773,58 @@ func toolDefs() []toolDef {
 		},
 		"additionalProperties": false,
 	}
+	executeBehavior := "Without nowait, blocks until the job finishes (equivalent to wait([job])) and returns " +
+		"the terminal result. With nowait, returns the job_id as soon as the process has started " +
+		"(a start failure is still returned immediately as a fail result). " +
+		"Whenever this call returns a terminal result (success or start failure), the job is deleted " +
+		"immediately afterwards and is no longer accessible: the result is delivered exactly once. " +
+		"Honours request cancellation; a cancelled blocking call tears down the job it started. " +
+		"Emits notifications/progress while blocking if the request carries _meta.progressToken. " +
+		"stdin is written before the call returns (cancellable); keep it small for children that " +
+		"never read stdin — a large write blocks until the process drains it or dies. Capture " +
+		"specs with \"from\" are character-aligned by default (see the stream-capture schema)."
+	executeDescription := "Run a shell command ($SHELL -c <command>, no PTY) as a job. " + executeBehavior
+	executeProperties := map[string]interface{}{
+		"command": map[string]interface{}{"type": "string", "description": "Shell command line to run."},
+		"cwd":     map[string]interface{}{"type": "string", "description": "Working directory for the process. Defaults to the server's own cwd."},
+		"env": map[string]interface{}{
+			"type":                 "object",
+			"description":          "Environment variables to set/override, layered on top of the server's own environment (not a full replacement).",
+			"additionalProperties": map[string]interface{}{"type": "string"},
+		},
+		"stdin":       map[string]interface{}{"type": "string", "description": "Optional data to write to the process's stdin immediately."},
+		"close_stdin": map[string]interface{}{"type": "boolean", "description": "Close stdin (EOF) after writing the optional stdin data. Default false: stdin stays open for later input() calls."},
+		"nowait":      map[string]interface{}{"type": "boolean", "description": "Return job_id immediately instead of blocking for completion."},
+		"capture":     capturePolicySchema,
+	}
+	if cfg.scriptFolder != "" {
+		executeDescription = fmt.Sprintf("Restricted mode (MCP_EXEC_SCRIPT_FOLDER=%q): run an executable file "+
+			"from that folder. The command argument must name an executable regular file inside "+
+			"MCP_EXEC_SCRIPT_FOLDER; it is passed literally as the first argument to $SHELL (there is no -c "+
+			"shell command line). The optional args array is passed as the script's subsequent argv "+
+			"($1, $2, ...), again without shell interpretation. Custom env overrides are not allowed in "+
+			"this mode. ", cfg.scriptFolder) + executeBehavior
+		executeProperties["command"] = map[string]interface{}{
+			"type": "string",
+			"description": fmt.Sprintf("Name of an executable file inside MCP_EXEC_SCRIPT_FOLDER (%s), "+
+				"or a path relative to it. It is passed literally as the first argument to $SHELL.", cfg.scriptFolder),
+		}
+		executeProperties["args"] = map[string]interface{}{
+			"type":        "array",
+			"items":       map[string]interface{}{"type": "string"},
+			"description": "Arguments passed literally to the script as its argv ($1, $2, ...).",
+		}
+		// env is not merely ignored: it is rejected at call time, so it must
+		// not be advertised in the schema either.
+		delete(executeProperties, "env")
+	}
 	return []toolDef{
 		{
-			Name: "execute",
-			Description: "Run a shell command ($SHELL -c <command>, no PTY) as a job. " +
-				"Without nowait, blocks until the job finishes (equivalent to wait([job])) and returns " +
-				"the terminal result. With nowait, returns the job_id as soon as the process has started " +
-				"(a start failure is still returned immediately as a fail result). " +
-				"Whenever this call returns a terminal result (success or start failure), the job is deleted " +
-				"immediately afterwards and is no longer accessible: the result is delivered exactly once. " +
-				"Honours request cancellation; a cancelled blocking call tears down the job it started. " +
-				"Emits notifications/progress while blocking if the request carries _meta.progressToken. " +
-				"stdin is written before the call returns (cancellable); keep it small for children that " +
-				"never read stdin — a large write blocks until the process drains it or dies. Capture " +
-				"specs with \"from\" are character-aligned by default (see the stream-capture schema).",
+			Name:        "execute",
+			Description: executeDescription,
 			InputSchema: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"command": map[string]interface{}{"type": "string", "description": "Shell command line to run."},
-					"cwd":     map[string]interface{}{"type": "string", "description": "Working directory for the process. Defaults to the server's own cwd."},
-					"env": map[string]interface{}{
-						"type":                 "object",
-						"description":          "Environment variables to set/override, layered on top of the server's own environment (not a full replacement).",
-						"additionalProperties": map[string]interface{}{"type": "string"},
-					},
-					"stdin":       map[string]interface{}{"type": "string", "description": "Optional data to write to the process's stdin immediately."},
-					"close_stdin": map[string]interface{}{"type": "boolean", "description": "Close stdin (EOF) after writing the optional stdin data. Default false: stdin stays open for later input() calls."},
-					"nowait":      map[string]interface{}{"type": "boolean", "description": "Return job_id immediately instead of blocking for completion."},
-					"capture":     capturePolicySchema,
-				},
+				"type":                 "object",
+				"properties":           executeProperties,
 				"required":             []string{"command"},
 				"additionalProperties": false,
 			},
@@ -1913,7 +2041,7 @@ func (s *server) handle(ctx context.Context, req rpcRequest) {
 			s.sendResult(req.ID, map[string]interface{}{})
 		}
 	case "tools/list":
-		s.sendResult(req.ID, map[string]interface{}{"tools": toolDefs()})
+		s.sendResult(req.ID, map[string]interface{}{"tools": toolDefs(s.mgr.cfg)})
 	case "tools/call":
 		s.handleToolsCall(ctx, req)
 	default:
