@@ -267,7 +267,8 @@ def restricted(image, restricted_scripts):
 @pytest.fixture()
 def bare_server(image):
     # No tini: the server runs as PID 1 and its orphan reaper must work.
-    c = MCPClient(image, command=["/usr/local/bin/mcp-exec"])
+    # --entrypoint replaces the image's `tini -- ...` so the server is PID 1.
+    c = MCPClient(image, podman_args=["--entrypoint", "/usr/local/bin/mcp-executor"])
     c.handshake()
     yield c
     c.close()
